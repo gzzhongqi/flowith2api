@@ -1,6 +1,8 @@
 import os
 import json
 import uuid
+import asyncio # <-- Added import
+import time # Ensure time is imported for timestamps
 from typing import List, Optional, Literal, Dict, Any, AsyncGenerator
 
 import httpx
@@ -233,51 +235,128 @@ async def chat_completions(
                 }
                 return JSONResponse(content=response_payload)
             else:
-                # Client wants streaming: Simulate streaming from the plain text response
+                # Client wants streaming: Implement keep-alive while fetching, then stream response
                 async def stream_generator() -> AsyncGenerator[str, None]:
-                    # Ensure necessary imports are available (time, json, uuid are already imported)
+                    response_ready_event = asyncio.Event()
+                    keep_alive_task = None
+                    fetch_task = None
+                    sse_model_name = request.model # Use the model requested by the client
 
-                    chunk_id = f"chatcmpl-{uuid.uuid4()}"
-                    model_name = request.model # Use the model requested by the client
+                    async def keep_alive_sender(event):
+                        while not event.is_set():
+                            try:
+                                # Yield keep-alive chunk
+                                keep_alive_data = {
+                                    "id": "chatcmpl-keepalive",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": sse_model_name, # Use client's requested model
+                                    "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]
+                                }
+                                yield f"data: {json.dumps(keep_alive_data)}\n\n"
+                                await asyncio.sleep(3) # Send every 3 seconds
+                            except asyncio.CancelledError:
+                                # print("Keep-alive cancelled") # Optional debug
+                                break
+                            except Exception as e:
+                                # print(f"Keep-alive error: {e}") # Optional debug
+                                break # Stop on error
 
-                    # Use the plain text directly as the full content
-                    full_content = flowith_text
+                    async def fetch_and_process(event):
+                        # This function now encapsulates the non-streaming fetch logic
+                        # It uses variables from the outer scope (client, FLOWITH_API_URL, headers, flowith_payload)
+                        # Note: flowith_text is already available in the outer scope from the initial non-streaming call
+                        try:
+                            # The actual HTTP request to Flowith has already completed
+                            # in the outer scope before stream_generator is even called.
+                            # We just need to signal completion and return the text.
+                            # If the request logic needed to be *inside* here, it would look like:
+                            # async with httpx.AsyncClient(timeout=300.0) as client:
+                            #     payload_bytes = json.dumps(flowith_payload.dict()).encode('utf-8')
+                            #     response = await client.post(FLOWITH_API_URL, content=payload_bytes, headers=headers)
+                            #     response.raise_for_status()
+                            #     fetched_text = response.text
+                            #     return fetched_text
 
-                    # Define chunk size
-                    chunk_size = 20
+                            # Since flowith_text is already fetched, just return it.
+                            # Add a small delay to simulate work if needed for testing keep-alive
+                            # await asyncio.sleep(5) # Simulate delay
+                            return flowith_text # Return the already fetched text
+                        finally:
+                            event.set() # Signal that fetch is done (or simulated done)
 
-                    # Stream fixed-size chunks
-                    for i in range(0, len(full_content), chunk_size):
-                        content_piece = full_content[i:i + chunk_size]
-                        chunk = {
+                    try:
+                        # Start keep-alive and fetch tasks
+                        keep_alive_task = asyncio.create_task(keep_alive_sender(response_ready_event))
+                        fetch_task = asyncio.create_task(fetch_and_process(response_ready_event))
+
+                        # Wait for the actual response text (which is already available)
+                        processed_flowith_text = await fetch_task
+
+                        # Now that response is ready (event is set, keep-alive will stop), proceed with chunking
+                        chunk_id = f"chatcmpl-{uuid.uuid4()}"
+                        chunk_size = 20
+                        full_content = processed_flowith_text
+
+                        # Stream fixed-size content chunks
+                        for i in range(0, len(full_content), chunk_size):
+                            content_piece = full_content[i:i + chunk_size]
+                            chunk = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": sse_model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": content_piece},
+                                    "finish_reason": None
+                                }]
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                            # Optional small delay between content chunks
+                            # await asyncio.sleep(0.01)
+
+                        # Send the final chunk with finish_reason
+                        final_chunk = {
                             "id": chunk_id,
                             "object": "chat.completion.chunk",
-                            "created": int(time.time()), # New timestamp for each chunk
-                            "model": model_name,
+                            "created": int(time.time()),
+                            "model": sse_model_name,
                             "choices": [{
                                 "index": 0,
-                                "delta": {"content": content_piece}, # Use the 20-char piece
-                                "finish_reason": None
+                                "delta": {},
+                                "finish_reason": "stop"
                             }]
                         }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        # Optional delay for simulation
-                        # await asyncio.sleep(0.01)
+                        yield f"data: {json.dumps(final_chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
 
-                    # Send the final chunk with finish_reason
-                    final_chunk = {
-                        "id": chunk_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()), # Use a final timestamp
-                        "model": model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {}, # Empty delta for final chunk
-                            "finish_reason": "stop" # Assume 'stop'
-                        }]
-                    }
-                    yield f"data: {json.dumps(final_chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
+                    except Exception as e:
+                        # Handle exceptions from fetch_task if needed
+                        # print(f"Error during fetch/processing: {e}") # Optional debug
+                        try:
+                            error_content = f"Error processing stream: {e}"
+                            error_chunk = {
+                                "id": f"chatcmpl-error-{uuid.uuid4()}",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": sse_model_name,
+                                "choices": [{"index": 0, "delta": {"content": error_content}, "finish_reason": "error"}] # Or use finish_reason: stop
+                            }
+                            yield f"data: {json.dumps(error_chunk)}\n\n"
+                        except Exception as yield_err:
+                            print(f"Error yielding error chunk: {yield_err}") # Log secondary error
+                        finally:
+                             yield "data: [DONE]\n\n" # Always send DONE if possible
+                    finally:
+                        # Ensure keep_alive task is stopped
+                        if keep_alive_task and not keep_alive_task.done():
+                            keep_alive_task.cancel()
+                            # Optionally await cancellation, but event.set() should handle graceful exit
+                            try:
+                                await keep_alive_task
+                            except asyncio.CancelledError:
+                                pass # Expected
 
                 return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
