@@ -208,46 +208,40 @@ async def chat_completions(
                     detail_msg = f"Flowith API Error ({response.status_code})"
                 raise HTTPException(status_code=response.status_code, detail=detail_msg)
 
-            # Attempt to parse the full response body as JSON
-            try:
-                flowith_data = response.json()
-            except json.JSONDecodeError as e:
-                print(f"Error decoding Flowith JSON response: {e}. Response text: {response.text[:200]}...")
-                raise HTTPException(status_code=502, detail=f"Invalid JSON response from Flowith: {e}")
+            # Get the plain text response directly
+            flowith_text = response.text
 
             # 7. Handle response based on *client's* request.stream preference
             if not request.stream:
-                # Client wants non-streaming: Return the parsed Flowith data directly
-                return JSONResponse(content=flowith_data)
+                # Client wants non-streaming: Construct OpenAI-compatible JSON from plain text
+                completion_id = f"chatcmpl-{uuid.uuid4()}"
+                created_timestamp = int(time.time())
+                response_payload = {
+                    "id": completion_id,
+                    "object": "chat.completion",
+                    "created": created_timestamp,
+                    "model": request.model, # Use the model from the original request
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": flowith_text # Use the plain text here
+                        },
+                        "finish_reason": "stop" # Assume stop
+                    }],
+                    # "usage": {...} # Usage stats are typically not available/meaningful here
+                }
+                return JSONResponse(content=response_payload)
             else:
-                # Client wants streaming: Simulate streaming from the complete response
-                # Client wants streaming: Simulate streaming word-by-word from the complete response
+                # Client wants streaming: Simulate streaming from the plain text response
                 async def stream_generator() -> AsyncGenerator[str, None]:
                     # Ensure necessary imports are available (time, json, uuid are already imported)
-                    # import time # Already imported around line 186
-                    # import json # Already imported at top
-                    # import uuid # Already imported at top
-                    # import asyncio # Needed only if adding delay
 
                     chunk_id = f"chatcmpl-{uuid.uuid4()}"
                     model_name = request.model # Use the model requested by the client
 
-                    # Extract full content safely
-                    full_content = ""
-                    try:
-                        # Try the expected structure first
-                        full_content = flowith_data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                        if not full_content:
-                             # Fallback: Check for other common fields
-                             full_content = flowith_data.get("text", flowith_data.get("completion", ""))
-
-                        if not full_content:
-                             print(f"Warning: Could not extract content for streaming from Flowith response: {flowith_data}")
-                             full_content = "" # Default to empty if extraction fails
-
-                    except (AttributeError, IndexError, TypeError) as e:
-                         print(f"Error extracting content for streaming: {e}. Data: {flowith_data}")
-                         full_content = "" # Default to empty on error
+                    # Use the plain text directly as the full content
+                    full_content = flowith_text
 
                     # Define chunk size
                     chunk_size = 20
