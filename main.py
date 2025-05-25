@@ -236,128 +236,97 @@ async def chat_completions(
                 return JSONResponse(content=response_payload)
             else:
                 # Client wants streaming: Implement keep-alive while fetching, then stream response
-                async def stream_generator() -> AsyncGenerator[str, None]:
+                async def stream_generator():
                     response_ready_event = asyncio.Event()
-                    keep_alive_task = None
                     fetch_task = None
+                    flowith_text_local = None # Use a local variable to avoid confusion with outer scope
+                    error_occurred = None
                     sse_model_name = request.model # Use the model requested by the client
 
-                    async def keep_alive_sender(event):
-                        while not event.is_set():
-                            try:
-                                # Yield keep-alive chunk
-                                keep_alive_data = {
-                                    "id": "chatcmpl-keepalive",
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": sse_model_name, # Use client's requested model
-                                    "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]
-                                }
-                                yield f"data: {json.dumps(keep_alive_data)}\n\n"
-                                await asyncio.sleep(3) # Send every 3 seconds
-                            except asyncio.CancelledError:
-                                # print("Keep-alive cancelled") # Optional debug
-                                break
-                            except Exception as e:
-                                # print(f"Keep-alive error: {e}") # Optional debug
-                                break # Stop on error
-
+                    # Coroutine to fetch data and signal completion
                     async def fetch_and_process(event):
-                        # This function now encapsulates the non-streaming fetch logic
-                        # It uses variables from the outer scope (client, FLOWITH_API_URL, headers, flowith_payload)
-                        # Note: flowith_text is already available in the outer scope from the initial non-streaming call
+                        nonlocal flowith_text_local, error_occurred
                         try:
-                            # The actual HTTP request to Flowith has already completed
-                            # in the outer scope before stream_generator is even called.
-                            # We just need to signal completion and return the text.
-                            # If the request logic needed to be *inside* here, it would look like:
-                            # async with httpx.AsyncClient(timeout=300.0) as client:
-                            #     payload_bytes = json.dumps(flowith_payload.dict()).encode('utf-8')
-                            #     response = await client.post(FLOWITH_API_URL, content=payload_bytes, headers=headers)
-                            #     response.raise_for_status()
-                            #     fetched_text = response.text
-                            #     return fetched_text
-
-                            # Since flowith_text is already fetched, just return it.
-                            # Add a small delay to simulate work if needed for testing keep-alive
-                            # await asyncio.sleep(5) # Simulate delay
-                            return flowith_text # Return the already fetched text
+                            # === Logic to prepare request (model_name, flowith_messages, etc.) ===
+                            # These variables are captured from the outer scope:
+                            # FLOWITH_API_URL, headers, flowith_payload
+                            # The actual request is made here now, not before calling stream_generator
+                            async with httpx.AsyncClient(timeout=300.0) as client:
+                                payload_bytes = json.dumps(flowith_payload.dict()).encode('utf-8') # Use outer flowith_payload
+                                response = await client.post(
+                                    FLOWITH_API_URL, headers=headers, content=payload_bytes # Use outer headers
+                                )
+                            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+                            flowith_text_local = response.text # Store in local variable
+                        except Exception as e:
+                            # print(f"Error fetching from Flowith: {e}") # Optional debug
+                            error_occurred = e # Store error to yield later
                         finally:
-                            event.set() # Signal that fetch is done (or simulated done)
+                            event.set() # Signal completion or failure
+
+                    # Start fetching in the background
+                    fetch_task = asyncio.create_task(fetch_and_process(response_ready_event))
 
                     try:
-                        # Start keep-alive and fetch tasks
-                        keep_alive_task = asyncio.create_task(keep_alive_sender(response_ready_event))
-                        fetch_task = asyncio.create_task(fetch_and_process(response_ready_event))
+                        # Send keep-alive chunks while waiting
+                        while not response_ready_event.is_set():
+                            keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk", "created": int(time.time()), "model": sse_model_name, "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
+                            yield f"data: {json.dumps(keep_alive_data)}\n\n"
+                            # Wait for a short period or until the event is set
+                            try:
+                                await asyncio.wait_for(response_ready_event.wait(), timeout=3.0)
+                            except asyncio.TimeoutError:
+                                pass # Timeout means event not set, continue loop
 
-                        # Wait for the actual response text (which is already available)
-                        processed_flowith_text = await fetch_task
+                        # Event is set, check if fetch task had an error
+                        if fetch_task.done() and fetch_task.exception():
+                            # If fetch_task failed before setting event (shouldn't happen with finally, but check anyway)
+                            error_occurred = fetch_task.exception()
 
-                        # Now that response is ready (event is set, keep-alive will stop), proceed with chunking
-                        chunk_id = f"chatcmpl-{uuid.uuid4()}"
-                        chunk_size = 20
-                        full_content = processed_flowith_text
+                        if error_occurred:
+                            # Yield an error chunk (optional, depends on desired behavior)
+                            # print(f"Yielding error chunk: {error_occurred}") # Optional debug
+                            error_content = f"Error processing request: {type(error_occurred).__name__}"
+                            error_chunk = {"id": f"chatcmpl-error-{uuid.uuid4()}", "object": "chat.completion.chunk", "created": int(time.time()), "model": sse_model_name, "choices": [{"delta": {"content": error_content }, "index": 0, "finish_reason": "error"}]} # Use finish_reason 'error' if possible
+                            yield f"data: {json.dumps(error_chunk)}\n\n"
+                        elif flowith_text_local is not None:
+                            # Fetch succeeded, yield content chunks
+                            chunk_id = f"chatcmpl-{uuid.uuid4()}"
+                            chunk_size = 20
+                            full_content = flowith_text_local
 
-                        # Stream fixed-size content chunks
-                        for i in range(0, len(full_content), chunk_size):
-                            content_piece = full_content[i:i + chunk_size]
-                            chunk = {
+                            for i in range(0, len(full_content), chunk_size):
+                                content_piece = full_content[i:i + chunk_size]
+                                chunk = {
+                                    "id": chunk_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": sse_model_name,
+                                    "choices": [{"index": 0, "delta": {"content": content_piece}, "finish_reason": None}]
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+
+                            # Yield final chunk
+                            final_chunk = {
                                 "id": chunk_id,
                                 "object": "chat.completion.chunk",
                                 "created": int(time.time()),
                                 "model": sse_model_name,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": content_piece},
-                                    "finish_reason": None
-                                }]
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                             }
-                            yield f"data: {json.dumps(chunk)}\n\n"
-                            # Optional small delay between content chunks
-                            # await asyncio.sleep(0.01)
+                            yield f"data: {json.dumps(final_chunk)}\n\n"
 
-                        # Send the final chunk with finish_reason
-                        final_chunk = {
-                            "id": chunk_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": sse_model_name,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop"
-                            }]
-                        }
-                        yield f"data: {json.dumps(final_chunk)}\n\n"
+                    except asyncio.CancelledError:
+                         # print("Stream generator cancelled (client disconnected)") # Optional debug
+                         raise # Re-raise cancellation
+                    finally:
+                        # Ensure fetch task is cancelled if generator exits early
+                        if fetch_task and not fetch_task.done():
+                            fetch_task.cancel()
+                        # Send DONE message regardless of success/failure/cancellation
                         yield "data: [DONE]\n\n"
 
-                    except Exception as e:
-                        # Handle exceptions from fetch_task if needed
-                        # print(f"Error during fetch/processing: {e}") # Optional debug
-                        try:
-                            error_content = f"Error processing stream: {e}"
-                            error_chunk = {
-                                "id": f"chatcmpl-error-{uuid.uuid4()}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": sse_model_name,
-                                "choices": [{"index": 0, "delta": {"content": error_content}, "finish_reason": "error"}] # Or use finish_reason: stop
-                            }
-                            yield f"data: {json.dumps(error_chunk)}\n\n"
-                        except Exception as yield_err:
-                            print(f"Error yielding error chunk: {yield_err}") # Log secondary error
-                        finally:
-                             yield "data: [DONE]\n\n" # Always send DONE if possible
-                    finally:
-                        # Ensure keep_alive task is stopped
-                        if keep_alive_task and not keep_alive_task.done():
-                            keep_alive_task.cancel()
-                            # Optionally await cancellation, but event.set() should handle graceful exit
-                            try:
-                                await keep_alive_task
-                            except asyncio.CancelledError:
-                                pass # Expected
-
+                # The return statement remains the same
                 return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
         except httpx.RequestError as exc:
