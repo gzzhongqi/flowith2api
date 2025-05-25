@@ -212,7 +212,7 @@ async def chat_completions(
 
             # Get the plain text response directly
             flowith_text = response.text
-
+            print(f"response preview: {flowith_text[:500]}")
             # 7. Handle response based on *client's* request.stream preference
             if not request.stream:
                 # Client wants non-streaming: Construct OpenAI-compatible JSON from plain text
@@ -258,7 +258,7 @@ async def chat_completions(
                                 )
                             response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
                             flowith_text_local = response.text # Store in local variable
-                            print(f"response preview: {flowith_text_local[:500]}")
+                            
                         except Exception as e:
                             # print(f"Error fetching from Flowith: {e}") # Optional debug
                             error_occurred = e # Store error to yield later
