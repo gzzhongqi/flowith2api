@@ -167,7 +167,7 @@ async def chat_completions(
     headers = {
         'accept': '*/*',
         'accept-language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7,zh-TW;q=0.6,ja;q=0.5',
-        'authorization': f'Bearer {FLOWITH_AUTH_TOKEN}', # Keep this dynamic
+        'authorization': FLOWITH_AUTH_TOKEN, # Send only the token, no "Bearer " prefix
         'content-type': 'application/json', 
         'origin': 'https://flowith.net',
         'priority': 'u=1, i',
