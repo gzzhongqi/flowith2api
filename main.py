@@ -134,25 +134,24 @@ async def chat_completions(
     is_claude_or_gemini = "claude" in flowith_model_name.lower() or "gemini" in flowith_model_name.lower()
 
     for msg in request.messages:
-        role = msg.role
-        if is_claude_or_gemini and role == "system":
-            # Convert system message to user message for Claude/Gemini via Flowith
-            role = "user"
-        elif role == "system":
-             # If it's a system message but not for Claude/Gemini, Flowith might not support it directly.
-             # Option 1: Skip it (might lose context)
-             # continue
-             # Option 2: Convert to user (might change semantics)
-             role = "user"
-             # Option 3: Prepend to the next user message (complex)
-             # For now, converting to 'user' is a simple approach.
-             print(f"Warning: Converting system message to 'user' for model {flowith_model_name}")
+        original_role = msg.role.lower() # Get original role
+        new_role = original_role # Start with original role
 
-        # Ensure only 'user' or 'assistant' roles are sent to Flowith
-        if role in ["user", "assistant"]:
-             processed_messages.append(FlowithMessage(role=role, content=msg.content))
-        # else: # Handle unexpected roles if necessary
+        # Check for Claude/Gemini system message conversion based on *requested* model
+        is_claude_or_gemini_requested = "claude" in request.model.lower() or "gemini" in request.model.lower()
+        if is_claude_or_gemini_requested and original_role == "system":
+            new_role = "user"
+        # Check for non-standard roles (applies AFTER potential system->user conversion for C/G)
+        elif original_role not in {"user", "assistant", "system"}:
+             new_role = "user"
+             print(f"Warning: Converting non-standard role '{original_role}' to 'user' for model {request.model}")
 
+        # Append message with the determined new_role, but only if it's valid for Flowith
+        # Flowith only accepts 'user' and 'assistant'
+        if new_role in ["user", "assistant"]:
+             processed_messages.append(FlowithMessage(role=new_role, content=msg.content))
+        # else: # Log or skip roles that are still 'system' after processing
+        #    print(f"Skipping message with final role '{new_role}' as it's not 'user' or 'assistant'. Original role: '{original_role}'")
 
     # 4. Construct Flowith Request Payload
     flowith_payload = FlowithRequest(
@@ -168,11 +167,11 @@ async def chat_completions(
         'accept': '*/*',
         'accept-language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7,zh-TW;q=0.6,ja;q=0.5',
         'authorization': FLOWITH_AUTH_TOKEN, # Send only the token, no "Bearer " prefix
-        'content-type': 'application/json', 
+        'content-type': 'application/json',
+        'responsetype': 'stream', # Restore this header
         'origin': 'https://flowith.net',
         'priority': 'u=1, i',
         'referer': 'https://flowith.net/',
-        'responsetype': 'stream', # Added - Was present in -H flags
         'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Windows"',
@@ -183,77 +182,122 @@ async def chat_completions(
     }
 
     # 6. Make Asynchronous Request to Flowith
-    async with httpx.AsyncClient(timeout=300.0) as client: # Increased timeout for potentially long requests
+    # Need time for simulated streaming chunks
+    import time
+    # Need JSONResponse
+    from fastapi.responses import JSONResponse
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
         try:
-            # Always use stream for the request to Flowith
-            # Serialize payload manually for content=
+            # Serialize payload manually
             payload_bytes = json.dumps(flowith_payload.dict()).encode('utf-8')
-            response_stream = client.stream( # Changed from post to stream
-                "POST", # Explicitly set method for stream
+
+            # Make a non-streaming POST request to Flowith
+            response = await client.post(
                 FLOWITH_API_URL,
-                content=payload_bytes, # Send serialized bytes
+                content=payload_bytes,
                 headers=headers,
             )
-            # Need to acquire the stream context
-            async with response_stream as response:
-                # Check status code *before* attempting to read the stream body
-                if response.status_code != 200:
-                    # Attempt to read error details from the response body if possible
-                    try:
-                        error_detail = await response.aread()
-                        detail_msg = f"Flowith API Error ({response.status_code}): {error_detail.decode()}"
-                    except Exception:
-                        detail_msg = f"Flowith API Error ({response.status_code})"
-                    # No need to manually close here, 'async with' handles it
-                    raise HTTPException(status_code=response.status_code, detail=detail_msg)
 
-                # 7. Handle Flowith Response based on *client's* request.stream preference
-                if request.stream:
-                    # Client wants streaming: Use StreamingResponse with the helper
-                    return StreamingResponse(
-                        stream_flowith_response(response), # Pass the response object itself
-                        media_type="text/event-stream"
-                    )
-                else:
-                    # Client wants non-streaming: Accumulate the response
-                    full_response_bytes = bytearray()
-                    try:
-                        async for chunk in response.aiter_bytes():
-                            full_response_bytes.extend(chunk)
-                    except Exception as e:
-                         # Handle potential errors during stream reading
-                         print(f"Error reading stream from Flowith: {e}")
-                         raise HTTPException(status_code=502, detail=f"Error reading stream from Flowith: {e}")
-                    finally:
-                         # 'async with' ensures the stream is closed
-                         pass
+            # Check status code after receiving the full response
+            if response.status_code != 200:
+                try:
+                    error_detail = response.text # Use .text for non-streaming
+                    detail_msg = f"Flowith API Error ({response.status_code}): {error_detail}"
+                except Exception:
+                    detail_msg = f"Flowith API Error ({response.status_code})"
+                raise HTTPException(status_code=response.status_code, detail=detail_msg)
 
-                    # Decode the accumulated bytes
-                    full_response_text = full_response_bytes.decode('utf-8')
+            # Attempt to parse the full response body as JSON
+            try:
+                flowith_data = response.json()
+            except json.JSONDecodeError as e:
+                print(f"Error decoding Flowith JSON response: {e}. Response text: {response.text[:200]}...")
+                raise HTTPException(status_code=502, detail=f"Invalid JSON response from Flowith: {e}")
 
-                    # Try to parse as JSON
+            # 7. Handle response based on *client's* request.stream preference
+            if not request.stream:
+                # Client wants non-streaming: Return the parsed Flowith data directly
+                return JSONResponse(content=flowith_data)
+            else:
+                # Client wants streaming: Simulate streaming from the complete response
+                # Client wants streaming: Simulate streaming word-by-word from the complete response
+                async def stream_generator() -> AsyncGenerator[str, None]:
+                    # Ensure necessary imports are available (time, json, uuid are already imported)
+                    # import time # Already imported around line 186
+                    # import json # Already imported at top
+                    # import uuid # Already imported at top
+                    # import asyncio # Needed only if adding delay
+
+                    chunk_id = f"chatcmpl-{uuid.uuid4()}"
+                    model_name = request.model # Use the model requested by the client
+
+                    # Extract full content safely
+                    full_content = ""
                     try:
-                        response_data = json.loads(full_response_text)
-                        from fastapi.responses import JSONResponse # Import locally if not already global
-                        return JSONResponse(content=response_data)
-                    except json.JSONDecodeError:
-                        # If not valid JSON, return as plain text
-                        print(f"Warning: Flowith response was not valid JSON. Returning as plain text. Content: {full_response_text[:200]}...") # Log snippet
-                        from fastapi.responses import PlainTextResponse # Import locally
-                        return PlainTextResponse(content=full_response_text)
+                        # Try the expected structure first
+                        full_content = flowith_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        if not full_content:
+                             # Fallback: Check for other common fields
+                             full_content = flowith_data.get("text", flowith_data.get("completion", ""))
+
+                        if not full_content:
+                             print(f"Warning: Could not extract content for streaming from Flowith response: {flowith_data}")
+                             full_content = "" # Default to empty if extraction fails
+
+                    except (AttributeError, IndexError, TypeError) as e:
+                         print(f"Error extracting content for streaming: {e}. Data: {flowith_data}")
+                         full_content = "" # Default to empty on error
+
+                    # Define chunk size
+                    chunk_size = 20
+
+                    # Stream fixed-size chunks
+                    for i in range(0, len(full_content), chunk_size):
+                        content_piece = full_content[i:i + chunk_size]
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()), # New timestamp for each chunk
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": content_piece}, # Use the 20-char piece
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        # Optional delay for simulation
+                        # await asyncio.sleep(0.01)
+
+                    # Send the final chunk with finish_reason
+                    final_chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()), # Use a final timestamp
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {}, # Empty delta for final chunk
+                            "finish_reason": "stop" # Assume 'stop'
+                        }]
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
         except httpx.RequestError as exc:
             print(f"Error requesting Flowith: {exc}")
             raise HTTPException(status_code=503, detail=f"Error connecting to Flowith service: {exc}")
         except HTTPException as http_exc:
-             # Re-raise HTTPExceptions raised during stream processing
-             raise http_exc
+            # Re-raise HTTPExceptions (e.g., from status code check or JSON parsing)
+            raise http_exc
         except Exception as exc:
-             print(f"Unexpected error during Flowith request/processing: {exc}")
-             # Log the traceback for debugging
-             import traceback
-             traceback.print_exc()
-             raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
+            print(f"Unexpected error during Flowith request/processing: {exc}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
 
 
 # --- Models Endpoint ---
