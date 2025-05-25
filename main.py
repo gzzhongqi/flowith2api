@@ -62,6 +62,17 @@ class FlowithRequest(BaseModel):
     stream: bool
     nodeId: str # UUID for Flowith
 
+
+# --- OpenAI Models Endpoint Models ---
+class ModelCard(BaseModel):
+    id: str
+    object: str = "model"
+    # owned_by: str = "user" # Optional: Add other fields if needed
+
+class ModelList(BaseModel):
+    object: str = "list"
+    data: List[ModelCard]
+
 # --- FastAPI App ---
 app = FastAPI(
     title="OpenAI to Flowith Proxy",
@@ -243,6 +254,19 @@ async def chat_completions(
              import traceback
              traceback.print_exc()
              raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
+
+
+# --- Models Endpoint ---
+@app.get("/v1/models", response_model=ModelList)
+async def list_models(api_key: str = Depends(verify_api_key)): # Protect with existing auth
+    """
+    Lists the available models based on the models.json mapping.
+    Follows the OpenAI API format.
+    """
+    model_cards = [
+        ModelCard(id=model_id) for model_id in model_mappings.keys()
+    ]
+    return ModelList(data=model_cards)
 
 
 # --- Optional: Add a root endpoint for health check ---

@@ -56,3 +56,7 @@ The Space will build the Docker image and start the service. The API endpoint wi
 *   **Request Body:** Send a JSON payload conforming to the OpenAI Chat Completions API schema (e.g., specifying `model`, `messages`, `stream`, etc.). The `model` field should correspond to a key in [`models.json`](models.json).
 *   **Authentication:** Requests must include an `Authorization` header with your API key. Use the format `Bearer your_api_key`. For example, if using the default key, the header would be `Authorization: Bearer 123456`.
 *   **Response:** The API will return either a standard JSON response or a server-sent event stream, mimicking the OpenAI API behavior based on the `stream` parameter in the request.
+*   **URL:** `/v1/models`
+*   **Method:** `GET`
+*   **Description:** Returns a list of available models supported by the proxy, based on the configuration in [`models.json`](models.json).
+*   **Authentication:** Requires the same `Authorization: Bearer <API_KEY>` header as the chat completions endpoint.
