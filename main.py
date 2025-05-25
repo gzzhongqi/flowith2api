@@ -258,6 +258,7 @@ async def chat_completions(
                                 )
                             response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
                             flowith_text_local = response.text # Store in local variable
+                            print(flowith_text_local[:500])
                         except Exception as e:
                             # print(f"Error fetching from Flowith: {e}") # Optional debug
                             error_occurred = e # Store error to yield later
