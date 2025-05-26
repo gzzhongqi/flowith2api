@@ -322,3 +322,45 @@ async def root():
 # if __name__ == "__main__":
 #     import uvicorn
 #     uvicorn.run(app, host="0.0.0.0", port=8000)
+                            fetch_task.cancel()
+                        # Send DONE message regardless of success/failure/cancellation
+                        yield "data: [DONE]\n\n"
+
+                # The return statement remains the same
+                return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+        except httpx.RequestError as exc:
+            print(f"Error requesting Flowith: {exc}")
+            raise HTTPException(status_code=503, detail=f"Error connecting to Flowith service: {exc}")
+        except HTTPException as http_exc:
+            # Re-raise HTTPExceptions (e.g., from status code check or JSON parsing)
+            raise http_exc
+        except Exception as exc:
+            print(f"Unexpected error during Flowith request/processing: {exc}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
+
+
+# --- Models Endpoint ---
+@app.get("/v1/models", response_model=ModelList)
+async def list_models(api_key: str = Depends(verify_api_key)): # Protect with existing auth
+    """
+    Lists the available models based on the models.json mapping.
+    Follows the OpenAI API format.
+    """
+    model_cards = [
+        ModelCard(id=model_id) for model_id in model_mappings.keys()
+    ]
+    return ModelList(data=model_cards)
+
+
+# --- Optional: Add a root endpoint for health check ---
+@app.get("/")
+async def root():
+    return {"message": "OpenAI to Flowith Proxy is running"}
+
+# --- To run locally (for development) ---
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
