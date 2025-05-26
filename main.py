@@ -189,7 +189,7 @@ async def chat_completions(
     # Need JSONResponse
     from fastapi.responses import JSONResponse
 
-    async with httpx.AsyncClient(timeout=300.0) as client:
+    async with httpx.AsyncClient(timeout=600.0) as client:
         try:
             # Serialize payload manually
             payload_bytes = json.dumps(flowith_payload.dict()).encode('utf-8')
