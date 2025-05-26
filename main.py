@@ -166,11 +166,11 @@ async def chat_completions(
     # 5. Prepare Headers for Flowith Request
     # Headers exactly matching the curl -H flags provided
     headers = {
-        'accept': 'text/event-stream', # Changed for streaming
+        'accept': '*/*',
         'accept-language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7,zh-TW;q=0.6,ja;q=0.5',
         'authorization': FLOWITH_AUTH_TOKEN, # Send only the token, no "Bearer " prefix
         'content-type': 'application/json',
-        'responsetype': 'stream', # Keep this header
+        'responsetype': 'stream', # Restore this header
         'origin': 'https://flowith.net',
         'priority': 'u=1, i',
         'referer': 'https://flowith.net/',
@@ -189,139 +189,139 @@ async def chat_completions(
     # Need JSONResponse
     from fastapi.responses import JSONResponse
 
-    # Need JSONResponse
-    from fastapi.responses import JSONResponse
-
     async with httpx.AsyncClient(timeout=300.0) as client:
         try:
-            # Serialize payload manually for the stream request
-            payload_json = flowith_payload.dict()
+            # Serialize payload manually
+            payload_bytes = json.dumps(flowith_payload.dict()).encode('utf-8')
 
-            # Use client.stream for real streaming
-            async with client.stream("POST", FLOWITH_API_URL, headers=headers, json=payload_json, timeout=300.0) as response:
-                # Check status *after* starting stream read or getting headers
-                # It's often better to check after reading the first chunk or headers
-                # For simplicity here, we might check early, but be aware Flowith might send errors mid-stream
-                # Let's check status right away, but handle potential errors during iteration too.
+            # Make a non-streaming POST request to Flowith
+            response = await client.post(
+                FLOWITH_API_URL,
+                content=payload_bytes,
+                headers=headers,
+            )
+
+            # Check status code after receiving the full response
+            if response.status_code != 200:
                 try:
-                    response.raise_for_status() # Check initial status
-                except httpx.HTTPStatusError as status_exc:
-                     # Attempt to read body for more details if possible
-                    try:
-                        error_body = await status_exc.response.aread()
-                        detail_msg = f"Flowith API Error ({status_exc.response.status_code}): {error_body.decode('utf-8', errors='replace')}"
-                    except Exception:
-                        detail_msg = f"Flowith API Error ({status_exc.response.status_code})"
-                    raise HTTPException(status_code=status_exc.response.status_code, detail=detail_msg) from status_exc
+                    error_detail = response.text # Use .text for non-streaming
+                    detail_msg = f"Flowith API Error ({response.status_code}): {error_detail}"
+                except Exception:
+                    detail_msg = f"Flowith API Error ({response.status_code})"
+                raise HTTPException(status_code=response.status_code, detail=detail_msg)
 
+            # Get the plain text response directly
+            flowith_text = response.text
 
-                # 7. Handle response based on *client's* request.stream preference
-                if request.stream:
-                    # Client wants streaming: Forward Flowith's stream directly
-                    async def stream_forwarder():
+            # 7. Handle response based on *client's* request.stream preference
+            if not request.stream:
+                # Client wants non-streaming: Construct OpenAI-compatible JSON from plain text
+                completion_id = f"chatcmpl-{uuid.uuid4()}"
+                created_timestamp = int(time.time())
+                response_payload = {
+                    "id": completion_id,
+                    "object": "chat.completion",
+                    "created": created_timestamp,
+                    "model": request.model, # Use the model from the original request
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": flowith_text # Use the plain text here
+                        },
+                        "finish_reason": "stop" # Assume stop
+                    }],
+                    # "usage": {...} # Usage stats are typically not available/meaningful here
+                }
+                return JSONResponse(content=response_payload)
+            else:
+                # Client wants streaming: Implement keep-alive while fetching, then stream response
+                async def stream_generator():
+                    response_ready_event = asyncio.Event()
+                    fetch_task = None
+                    flowith_text_local = None # Use a local variable to avoid confusion with outer scope
+                    error_occurred = None
+                    sse_model_name = request.model # Use the model requested by the client
+
+                    # Coroutine to fetch data and signal completion
+                    async def fetch_and_process(event):
+                        nonlocal flowith_text_local, error_occurred
                         try:
-                            async for chunk in response.aiter_bytes():
-                                # Assuming Flowith sends SSE-compatible chunks (or raw data we want to forward)
-                                # If Flowith sends *only* text content per chunk, we might need to format it:
-                                # yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk.decode()}}]})}\n\n"
-                                # For now, let's assume Flowith sends pre-formatted SSE or raw bytes are okay.
-                                yield chunk
-                            # Optionally yield a final [DONE] message if Flowith doesn't
-                            # yield b"data: [DONE]\n\n"
-                        except httpx.RequestError as stream_exc:
-                            print(f"Error during Flowith stream read: {stream_exc}")
-                            # Decide how to signal this error to the client.
-                            # Option 1: Raise an exception (FastAPI might handle it)
-                            # raise HTTPException(status_code=503, detail=f"Stream read error: {stream_exc}")
-                            # Option 2: Yield an error message within the stream (if client supports it)
-                            error_content = f"Stream read error: {type(stream_exc).__name__}"
-                            error_chunk = {"id": f"chatcmpl-streamerror-{uuid.uuid4()}", "object": "chat.completion.chunk", "created": int(time.time()), "model": request.model, "choices": [{"delta": {"content": error_content }, "index": 0, "finish_reason": "error"}]}
-                            yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
-                            yield b"data: [DONE]\n\n" # Still send DONE after error chunk
+                            # === Logic to prepare request (model_name, flowith_messages, etc.) ===
+                            # These variables are captured from the outer scope:
+                            # FLOWITH_API_URL, headers, flowith_payload
+                            # The actual request is made here now, not before calling stream_generator
+                            async with httpx.AsyncClient(timeout=300.0) as client:
+                                payload_bytes = json.dumps(flowith_payload.dict()).encode('utf-8') # Use outer flowith_payload
+                                response = await client.post(
+                                    FLOWITH_API_URL, headers=headers, content=payload_bytes # Use outer headers
+                                )
+                            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+                            flowith_text_local = response.text # Store in local variable
                         except Exception as e:
-                            print(f"Unexpected error during stream forward: {e}")
-                            error_content = f"Unexpected stream error: {type(e).__name__}"
-                            error_chunk = {"id": f"chatcmpl-streamerror-{uuid.uuid4()}", "object": "chat.completion.chunk", "created": int(time.time()), "model": request.model, "choices": [{"delta": {"content": error_content }, "index": 0, "finish_reason": "error"}]}
-                            yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
-                            yield b"data: [DONE]\n\n" # Still send DONE after error chunk
+                            # print(f"Error fetching from Flowith: {e}") # Optional debug
+                            error_occurred = e # Store error to yield later
+                        finally:
+                            event.set() # Signal completion or failure
 
+                    # Start fetching in the background
+                    fetch_task = asyncio.create_task(fetch_and_process(response_ready_event))
 
-                    return StreamingResponse(stream_forwarder(), media_type="text/event-stream")
-
-                else:
-                    # Client wants non-streaming: Accumulate chunks
-                    chunks = []
                     try:
-                        async for chunk in response.aiter_bytes():
-                            chunks.append(chunk)
-                    except httpx.RequestError as stream_exc:
-                         print(f"Error during Flowith stream read (non-streaming mode): {stream_exc}")
-                         raise HTTPException(status_code=503, detail=f"Stream read error: {stream_exc}")
-                    except Exception as e:
-                         print(f"Unexpected error during stream accumulation: {e}")
-                         raise HTTPException(status_code=500, detail=f"Unexpected stream error: {e}")
+                        # Send keep-alive chunks while waiting
+                        while not response_ready_event.is_set():
+                            keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk", "created": int(time.time()), "model": sse_model_name, "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
+                            yield f"data: {json.dumps(keep_alive_data)}\n\n"
+                            # Wait for a short period or until the event is set
+                            try:
+                                await asyncio.wait_for(response_ready_event.wait(), timeout=3.0)
+                            except asyncio.TimeoutError:
+                                pass # Timeout means event not set, continue loop
 
+                        # Event is set, check if fetch task had an error
+                        if fetch_task.done() and fetch_task.exception():
+                            # If fetch_task failed before setting event (shouldn't happen with finally, but check anyway)
+                            error_occurred = fetch_task.exception()
 
-                    full_response_bytes = b"".join(chunks)
-                    flowith_text = full_response_bytes.decode('utf-8', errors='replace')
-                    print(f"Accumulated response preview: {flowith_text[:500]}")
+                        if error_occurred:
+                            # Yield an error chunk (optional, depends on desired behavior)
+                            # print(f"Yielding error chunk: {error_occurred}") # Optional debug
+                            error_content = f"Error processing request: {type(error_occurred).__name__}"
+                            error_chunk = {"id": f"chatcmpl-error-{uuid.uuid4()}", "object": "chat.completion.chunk", "created": int(time.time()), "model": sse_model_name, "choices": [{"delta": {"content": error_content }, "index": 0, "finish_reason": "error"}]} # Use finish_reason 'error' if possible
+                            yield f"data: {json.dumps(error_chunk)}\n\n"
+                        elif flowith_text_local is not None:
+                            # Fetch succeeded, yield content chunks
+                            chunk_id = f"chatcmpl-{uuid.uuid4()}"
+                            chunk_size = 20
+                            full_content = flowith_text_local
 
-                    # Construct OpenAI-compatible JSON
-                    completion_id = f"chatcmpl-{uuid.uuid4()}"
-                    created_timestamp = int(time.time())
-                    response_payload = {
-                        "id": completion_id,
-                        "object": "chat.completion",
-                        "created": created_timestamp,
-                        "model": request.model, # Use the model from the original request
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": flowith_text
-                            },
-                            "finish_reason": "stop" # Assume stop
-                        }],
-                        # "usage": {...} # Usage stats are typically not available/meaningful here
-                    }
-                    return JSONResponse(content=response_payload)
+                            for i in range(0, len(full_content), chunk_size):
+                                content_piece = full_content[i:i + chunk_size]
+                                chunk = {
+                                    "id": chunk_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": sse_model_name,
+                                    "choices": [{"index": 0, "delta": {"content": content_piece}, "finish_reason": None}]
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
 
-        # Keep outer exception handling for initial connection errors etc.
-        except httpx.RequestError as exc:
-            print(f"Error requesting Flowith: {exc}")
-            raise HTTPException(status_code=503, detail=f"Error connecting to Flowith service: {exc}")
-        except HTTPException as http_exc:
-            # Re-raise HTTPExceptions (e.g., from status code check or JSON parsing)
-            raise http_exc
-        except Exception as exc:
-            print(f"Unexpected error during Flowith request/processing: {exc}")
-            import traceback
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
+                            # Yield final chunk
+                            final_chunk = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": sse_model_name,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                            }
+                            yield f"data: {json.dumps(final_chunk)}\n\n"
 
-
-# --- Models Endpoint ---
-@app.get("/v1/models", response_model=ModelList)
-async def list_models(api_key: str = Depends(verify_api_key)): # Protect with existing auth
-    """
-    Lists the available models based on the models.json mapping.
-    Follows the OpenAI API format.
-    """
-    model_cards = [
-        ModelCard(id=model_id) for model_id in model_mappings.keys()
-    ]
-    return ModelList(data=model_cards)
-
-
-# --- Optional: Add a root endpoint for health check ---
-@app.get("/")
-async def root():
-    return {"message": "OpenAI to Flowith Proxy is running"}
-
-# --- To run locally (for development) ---
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
+                    except asyncio.CancelledError:
+                         # print("Stream generator cancelled (client disconnected)") # Optional debug
+                         raise # Re-raise cancellation
+                    finally:
+                        # Ensure fetch task is cancelled if generator exits early
+                        if fetch_task and not fetch_task.done():
                             fetch_task.cancel()
                         # Send DONE message regardless of success/failure/cancellation
                         yield "data: [DONE]\n\n"
